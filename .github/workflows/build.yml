@@ -1,0 +1,125 @@
+name: Build VC++ 2008 and Release
+
+on:
+  # Build & release automatically when you push a tag like v1.2.3
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  
+permissions:
+  contents: write   # needed to create releases and upload assets
+
+env:
+  # === EDIT THESE PATHS FOR YOUR REPO ===
+  SOLUTION_PATH: DeskPins.sln
+  # Root(s) where your built binaries end up per platform. Adjust as needed.
+  # Example below assumes typical VC++ layouts; change to your actual output dirs.
+  OUT_WIN32: bin\Win32\Release
+  OUT_X64:   bin\x64\Release
+
+jobs:
+  build:
+    name: Build (${{ matrix.platform }})
+    runs-on: [self-hosted, windows, vs2008]
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [Win32, x64]
+
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+
+    steps:
+      - name: Checkout
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Determine version
+        id: version
+        shell: pwsh
+        run: |
+          if ("${{ github.ref_type }}" -eq "tag") {
+            $v = "${{ github.ref_name }}"
+          } elseif ("${{ github.event.inputs.version }}") {
+            $v = "${{ github.event.inputs.version }}"
+          } else {
+            $v = "v0.0.0-${{ github.run_number }}"
+          }
+          "version=$v" >> $env:GITHUB_OUTPUT
+          Write-Host "Using version: $v"
+
+      - name: Build Release (${{ matrix.platform }})
+        shell: pwsh
+        run: |
+          $devenv = "${env:ProgramFiles(x86)}\Microsoft Visual Studio 9.0\Common7\IDE\devenv.com"
+          if (!(Test-Path $devenv)) {
+            throw "VS2008 not found at $devenv. Install VS2008 on this self-hosted runner."
+          }
+          & $devenv "${{ env.SOLUTION_PATH }}" /rebuild "Release|${{ matrix.platform }}"
+          if ($LASTEXITCODE -ne 0) { throw "devenv build failed with exit code $LASTEXITCODE" }
+
+      - name: Package artifact (${{ matrix.platform }})
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+          if ("${{ matrix.platform }}" -eq "Win32") {
+            $out = "${{ env.OUT_WIN32 }}"
+          } else {
+            $out = "${{ env.OUT_X64 }}"
+          }
+
+          if (!(Test-Path $out)) {
+            throw "Output folder not found: $out. Update OUT_WIN32/OUT_X64 in the workflow."
+          }
+
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $zip = "dist\${version}-${{ matrix.platform }}.zip"
+
+          # Include common binaries; adjust patterns as needed
+          $items = Get-ChildItem $out -Recurse -Include *.exe,*.dll,*.pdb,*.lib,*.ini,*.cfg,*.txt -ErrorAction SilentlyContinue
+          if ($items.Count -eq 0) {
+            Write-Warning "No files matched in $out. Zipping entire folder."
+            Compress-Archive -Path "$out\*" -DestinationPath $zip -Force
+          } else {
+            Compress-Archive -Path $items.FullName -DestinationPath $zip -Force
+          }
+
+          Write-Host "Created $zip"
+
+      - name: Upload artifact (${{ matrix.platform }})
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ steps.version.outputs.version }}-${{ matrix.platform }}
+          path: dist\*.zip
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: [self-hosted, windows, vs2008]
+
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: build-${{ needs.build.outputs.version }}-*
+          merge-multiple: true
+          path: dist
+
+      - name: List artifacts
+        shell: pwsh
+        run: Get-ChildItem dist
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.build.outputs.version }}
+          name: ${{ needs.build.outputs.version }}
+          draft: false
+          prerelease: false
+          files: |
+            dist\*.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
